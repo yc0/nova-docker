@@ -50,3 +50,6 @@ ChangeLog
 *~
 *.swp
 *.swo
+
+# Mac
+.DS_Store
