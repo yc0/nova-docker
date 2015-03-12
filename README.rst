@@ -151,6 +151,7 @@ Currently, the user_data support those parameters::
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 I demostrate HOT format::
+
   resources:
     docker_image:
       type: OS::Nova::Server
@@ -167,8 +168,8 @@ I demostrate HOT format::
 3. Contact 
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-I just start the project, if you are as intersted as in the topic 
-welcome to contact me: linyencheng@gmail.com
+I just start the project, if you are as intersted as in the topic.
+Welcome to contact me: linyencheng@gmail.com
 
 
 -----
