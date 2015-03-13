@@ -19,6 +19,7 @@ A Docker Hypervisor which allows running Linux Containers instead of VMs.
 """
 
 import os
+import shutil
 import socket
 import time
 import uuid
@@ -39,15 +40,17 @@ from nova.compute import flavors
 from nova.compute import power_state
 from nova.compute import task_states
 from nova import exception
-from nova.i18n import _
+from nova.i18n import _, _LI, _LE, _LW
 from nova.image import glance
 from nova.openstack.common import fileutils
 from nova.openstack.common import log
 from nova.openstack.common import excutils
 
 from nova import utils
+from nova import utils as nova_utils
 from nova.virt import driver
 from nova.virt import firewall
+from nova.virt import hardware
 from nova.virt import images
 from nova.virt.libvirt import blockinfo
 
@@ -65,6 +68,9 @@ CONF.import_opt('my_ip', 'nova.netconf')
 CONF.import_opt('instances_path', 'nova.compute.manager')
 
 docker_opts = [
+    cfg.StrOpt('root_directory',
+               default='/var/lib/docker',
+               help='Path to use as the root of the Docker runtime.'),
     cfg.StrOpt('host_url',
                default='unix:///var/run/docker.sock',
                help='tcp://host:port to bind/connect to or '
@@ -86,7 +92,10 @@ docker_opts = [
     cfg.StrOpt('snapshots_directory',
                default='$instances_path/snapshots',
                help='Location where docker driver will temporarily store '
-                    'snapshots.')
+                    'snapshots.'),
+    cfg.BoolOpt('inject_key',
+                default=False,
+                help='Inject the ssh public key at boot time'),
 ]
 
 CONF.register_opts(docker_opts, 'docker')
@@ -377,8 +386,32 @@ class DockerDriver(driver.ComputeDriver):
 
         return self.docker.inspect_image(self._encode_utf8(image_meta['name']))
 
+    def _extract_dns_entries(self, network_info):
+        dns = []
+        if network_info:
+            for net in network_info:
+                subnets = net['network'].get('subnets', [])
+                for subnet in subnets:
+                    dns_entries = subnet.get('dns', [])
+                    for dns_entry in dns_entries:
+                        if 'address' in dns_entry:
+                            dns.append(dns_entry['address'])
+        return dns if dns else None
+
+    def _get_key_binds(self, container_id, instance):
+        binds = None
+        # Handles the key injection.
+        if CONF.docker.inject_key and instance.get('key_data'):
+            key = str(instance['key_data'])
+            mount_origin = self._inject_key(container_id, key)
+            binds = {mount_origin: {'bind': '/root/.ssh', 'ro': True}}
+        return binds
+
     def _start_container(self, container_id, instance, network_info=None):
-        self.docker.start(container_id)
+        binds = self._get_key_binds(container_id, instance)
+        dns = self._extract_dns_entries(network_info)
+        self.docker.start(container_id, binds=binds, dns=dns)
+
         if not network_info:
             return
         try:
@@ -394,7 +427,8 @@ class DockerDriver(driver.ComputeDriver):
                                                   instance_id=instance['name'])
 
     def spawn(self, context, instance, image_meta, injected_files,
-              admin_password, network_info=None, block_device_info=None):
+              admin_password, network_info=None, block_device_info=None,
+              flavor=None):
         image_name = self._get_image_name(context, instance, image_meta)
         args = {
             'hostname': instance['name'],
@@ -420,7 +454,11 @@ class DockerDriver(driver.ComputeDriver):
             'host_config': None,
         }
 
-        image = self.docker.inspect_image(self._encode_utf8(image_name))
+        try:
+            image = self.docker.inspect_image(self._encode_utf8(image_name))
+        except errors.APIError:
+            image = None
+
         if not image:
             image = self._pull_missing_image(context, image_meta, instance)
         if not (image and image['ContainerConfig']['Cmd']):
@@ -559,6 +597,39 @@ class DockerDriver(driver.ComputeDriver):
 
         self._start_container(container_id, instance, network_info)
 
+    def _inject_key(self, id, key):
+        if isinstance(id, dict):
+            id = id.get('id')
+        sshdir = os.path.join(CONF.instances_path, id, '.ssh')
+        key_data = ''.join([
+            '\n',
+            '# The following ssh key was injected by Nova',
+            '\n',
+            key.strip(),
+            '\n',
+        ])
+        fileutils.ensure_tree(sshdir)
+        keys_file = os.path.join(sshdir, 'authorized_keys')
+        with open(keys_file, 'a') as f:
+            f.write(key_data)
+        os.chmod(sshdir, 0o700)
+        os.chmod(keys_file, 0o600)
+        return sshdir
+
+    def _cleanup_key(self, instance, id):
+        if isinstance(id, dict):
+            id = id.get('id')
+        dir = os.path.join(CONF.instances_path, id)
+        if os.path.exists(dir):
+            LOG.info(_LI('Deleting instance files %s'), dir,
+                     instance=instance)
+            try:
+                shutil.rmtree(dir)
+            except OSError as e:
+                LOG.error(_LE('Failed to cleanup directory %(target)s: '
+                              '%(e)s'), {'target': dir, 'e': e},
+                          instance=instance)
+
     def restore(self, instance):
         container_id = self._get_container_id(instance)
         if not container_id:
@@ -598,6 +669,7 @@ class DockerDriver(driver.ComputeDriver):
         '''
         if CONF.docker.inject_key:
             self._cleanup_key(instance, container_id)
+
 
 
         # FIXME(wangpan): if the instance is booted again here, such as the
@@ -670,7 +742,9 @@ class DockerDriver(driver.ComputeDriver):
                         exc_info=True)
             return
 
-        self.docker.start(container_id)
+        binds = self._get_key_binds(container_id, instance)
+        dns = self._extract_dns_entries(network_info)
+        self.docker.start(container_id, binds=binds, dns=dns)
         try:
             if network_info:
                 self.plug_vifs(instance, network_info)
@@ -684,7 +758,9 @@ class DockerDriver(driver.ComputeDriver):
         container_id = self._get_container_id(instance)
         if not container_id:
             return
-        self.docker.start(container_id)
+        binds = self._get_key_binds(container_id, instance)
+        dns = self._extract_dns_entries(network_info)
+        self.docker.start(container_id, binds=binds, dns=dns)
         if not network_info:
             return
         try:
@@ -740,7 +816,7 @@ class DockerDriver(driver.ComputeDriver):
     def get_console_output(self, context, instance):
         container_id = self._get_container_id(instance)
         if not container_id:
-            return
+            return ''
         return self.docker.get_container_logs(container_id)
 
     def snapshot(self, context, instance, image_href, update_task_state):
@@ -944,7 +1020,4 @@ class DockerDriver(driver.ComputeDriver):
                              block_device_info=block_device_info)
                 raise exception.VirtualInterfaceCreateException()
 
-        # Resume only if domain has been paused
-        if launch_flags & libvirt.VIR_DOMAIN_START_PAUSED:
-            domain.resume()
         return domain
